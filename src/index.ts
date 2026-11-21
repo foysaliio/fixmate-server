@@ -1,17 +1,32 @@
 import express from "express";
-import { toNodeHandler } from "better-auth/node";
+import { fromNodeHeaders, toNodeHandler } from "better-auth/node";
 import { ObjectId, type Document, type Filter, type Sort } from "mongodb";
 import { auth } from "./lib/auth.ts";
 import { mongoClient, mongoDatabase } from "./lib/mongodb.ts";
+import { createAccessToken } from "./lib/access-token.ts";
 
 const app = express();
-const port = 5000;
+const port = Number(process.env.PORT) || 5000;
 
 app.all("/api/auth/*splat", toNodeHandler(auth));
 app.use(express.json());
 
 app.get("/api/health", (_request, response) => {
   response.json({ status: "ok" });
+});
+
+app.post("/api/access-token", async (request, response) => {
+  const session = await auth.api.getSession({
+    headers: fromNodeHeaders(request.headers),
+  });
+
+  if (!session) {
+    response.status(401).json({ message: "Unauthorized" });
+    return;
+  }
+
+  const accessToken = await createAccessToken(session.user.id);
+  response.json({ accessToken, expiresIn: 600 });
 });
 
 app.get("/api/services", async (request, response) => {
