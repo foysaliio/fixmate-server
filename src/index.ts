@@ -1,5 +1,5 @@
 import express from "express";
-import type { Document, Filter, Sort } from "mongodb";
+import { ObjectId, type Document, type Filter, type Sort } from "mongodb";
 import { mongoClient, mongoDatabase } from "./lib/mongodb.ts";
 
 const app = express();
@@ -45,6 +45,28 @@ app.get("/api/services", async (request, response) => {
     .toArray();
 
   response.json(services);
+});
+
+app.get("/api/services/:id", async (request, response) => {
+  const { id } = request.params;
+
+  if (typeof id !== "string" || !ObjectId.isValid(id)) {
+    response.status(404).json({ message: "Service not found" });
+    return;
+  }
+
+  const service = await mongoDatabase.collection("services").findOne({
+    _id: new ObjectId(id),
+    approvalStatus: "approved",
+    isAvailable: true,
+  });
+
+  if (!service) {
+    response.status(404).json({ message: "Service not found" });
+    return;
+  }
+
+  response.json(service);
 });
 
 async function startServer() {
