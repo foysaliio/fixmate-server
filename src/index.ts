@@ -1,9 +1,14 @@
 import express from "express";
+import { toNodeHandler } from "better-auth/node";
 import { ObjectId, type Document, type Filter, type Sort } from "mongodb";
+import { auth } from "./lib/auth.ts";
 import { mongoClient, mongoDatabase } from "./lib/mongodb.ts";
 
 const app = express();
 const port = 5000;
+
+app.all("/api/auth/*splat", toNodeHandler(auth));
+app.use(express.json());
 
 app.get("/api/health", (_request, response) => {
   response.json({ status: "ok" });
