@@ -5,6 +5,7 @@ import { auth } from "./lib/auth.ts";
 import { mongoClient, mongoDatabase } from "./lib/mongodb.ts";
 import { createAccessToken } from "./lib/access-token.ts";
 import { verifyToken } from "./middleware/auth.ts";
+import { parseImage, uploadImage } from "./routes/upload-image.ts";
 
 const app = express();
 const port = Number(process.env.PORT) || 5000;
@@ -29,6 +30,8 @@ app.post("/api/access-token", async (request, response) => {
   const accessToken = await createAccessToken(session.user.id);
   response.json({ accessToken, expiresIn: 600 });
 });
+
+app.post("/api/uploads/image", verifyToken, parseImage, uploadImage);
 
 const profileFields = new Set(["name", "phone", "area", "bio", "image"]);
 
