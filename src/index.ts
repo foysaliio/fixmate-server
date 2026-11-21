@@ -8,6 +8,16 @@ app.get("/api/health", (_request, response) => {
   response.json({ status: "ok" });
 });
 
+app.get("/api/services", async (_request, response) => {
+  const services = await mongoDatabase
+    .collection("services")
+    .find({ approvalStatus: "approved", isAvailable: true })
+    .sort({ createdAt: -1 })
+    .toArray();
+
+  response.json(services);
+});
+
 async function startServer() {
   try {
     await mongoClient.connect();
