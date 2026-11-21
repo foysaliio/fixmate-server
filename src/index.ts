@@ -4,6 +4,7 @@ import { ObjectId, type Document, type Filter, type Sort } from "mongodb";
 import { auth } from "./lib/auth.ts";
 import { mongoClient, mongoDatabase } from "./lib/mongodb.ts";
 import { createAccessToken } from "./lib/access-token.ts";
+import { verifyToken } from "./middleware/auth.ts";
 
 const app = express();
 const port = Number(process.env.PORT) || 5000;
@@ -27,6 +28,83 @@ app.post("/api/access-token", async (request, response) => {
 
   const accessToken = await createAccessToken(session.user.id);
   response.json({ accessToken, expiresIn: 600 });
+});
+
+const profileFields = new Set(["name", "phone", "area", "bio", "image"]);
+
+function isImgBbImageUrl(value: string) {
+  try {
+    const url = new URL(value);
+    return (
+      url.protocol === "https:" &&
+      url.hostname === "i.ibb.co" &&
+      !url.port &&
+      !url.username &&
+      !url.password &&
+      url.pathname.length > 1
+    );
+  } catch {
+    return false;
+  }
+}
+
+app.patch("/api/users/profile", verifyToken, async (request, response) => {
+  const body: unknown = request.body;
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    response.status(400).json({ message: "Invalid profile data" });
+    return;
+  }
+
+  const entries = Object.entries(body);
+  if (!entries.length || entries.some(([key]) => !profileFields.has(key))) {
+    response.status(400).json({ message: "Only name, phone, area, bio and image can be updated" });
+    return;
+  }
+
+  const updates: Record<string, string | null | Date> = {};
+  for (const [key, value] of entries) {
+    if (key === "image") {
+      if (value !== null && (typeof value !== "string" || !isImgBbImageUrl(value))) {
+        response.status(400).json({ message: "Image must be an HTTPS ImgBB image URL" });
+        return;
+      }
+      updates.image = value;
+      continue;
+    }
+
+    if (typeof value !== "string" || (key === "name" && !value.trim())) {
+      response.status(400).json({ message: `Invalid ${key}` });
+      return;
+    }
+    updates[key] = value.trim();
+  }
+
+  updates.updatedAt = new Date();
+  const userId = (response.locals.authUser as { id: string }).id;
+  const user = await mongoDatabase.collection("users").findOneAndUpdate(
+    { _id: new ObjectId(userId) },
+    { $set: updates },
+    {
+      returnDocument: "after",
+      projection: { name: 1, email: 1, role: 1, phone: 1, area: 1, bio: 1, image: 1 },
+    },
+  );
+
+  if (!user) {
+    response.status(404).json({ message: "User not found" });
+    return;
+  }
+
+  response.json({
+    id: String(user._id),
+    name: user.name,
+    email: user.email,
+    role: user.role,
+    phone: user.phone ?? "",
+    area: user.area ?? "",
+    bio: user.bio ?? "",
+    image: user.image ?? null,
+  });
 });
 
 app.get("/api/services", async (request, response) => {
