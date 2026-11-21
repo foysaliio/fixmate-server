@@ -38,11 +38,22 @@ app.get("/api/services", async (request, response) => {
         ? { basePrice: -1 }
         : { createdAt: -1 };
 
-  const services = await mongoDatabase
+  const requestedLimit = typeof request.query.limit === "string" ? request.query.limit : "";
+  const parsedLimit = Number(requestedLimit);
+  const limit = /^[1-9]\d*$/.test(requestedLimit) && Number.isSafeInteger(parsedLimit)
+    ? parsedLimit
+    : undefined;
+
+  const cursor = mongoDatabase
     .collection("services")
     .find(filter)
-    .sort(sort)
-    .toArray();
+    .sort(limit === undefined ? sort : { createdAt: -1 });
+
+  if (limit !== undefined) {
+    cursor.limit(limit);
+  }
+
+  const services = await cursor.toArray();
 
   response.json(services);
 });
