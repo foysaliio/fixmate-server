@@ -243,6 +243,134 @@ app.get("/api/services/my", verifyToken, verifyTechnician, async (_request, resp
   response.json(services);
 });
 
+const editableServiceFields = new Set([
+  "title",
+  "description",
+  "category",
+  "basePrice",
+  "estimatedDuration",
+  "serviceMode",
+  "serviceArea",
+  "image",
+]);
+
+function ownedServiceFilter(id: string, technicianId: string): Filter<Document> {
+  return {
+    _id: new ObjectId(id),
+    technicianId: { $in: [technicianId, new ObjectId(technicianId)] },
+  };
+}
+
+app.patch("/api/services/:id", verifyToken, verifyTechnician, async (request, response) => {
+  const { id } = request.params;
+  if (typeof id !== "string" || !ObjectId.isValid(id)) {
+    response.status(404).json({ message: "Service not found" });
+    return;
+  }
+
+  const body: unknown = request.body;
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    response.status(400).json({ message: "Invalid service data" });
+    return;
+  }
+
+  const entries = Object.entries(body);
+  if (!entries.length || entries.some(([key]) => !editableServiceFields.has(key))) {
+    response.status(400).json({ message: "Invalid service fields" });
+    return;
+  }
+
+  const updates: Record<string, string | number> = {};
+  for (const [key, value] of entries) {
+    if (["title", "description", "estimatedDuration", "serviceArea"].includes(key)) {
+      if (typeof value !== "string" || !value.trim()) {
+        response.status(400).json({ message: `Invalid ${key}` });
+        return;
+      }
+      updates[key] = value.trim();
+    } else if (key === "category") {
+      if (typeof value !== "string" || !serviceCategories.has(value)) {
+        response.status(400).json({ message: "Invalid category" });
+        return;
+      }
+      updates.category = value;
+    } else if (key === "serviceMode") {
+      if (typeof value !== "string" || !serviceModes.has(value)) {
+        response.status(400).json({ message: "Invalid serviceMode" });
+        return;
+      }
+      updates.serviceMode = value;
+    } else if (key === "basePrice") {
+      if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+        response.status(400).json({ message: "basePrice must be greater than 0" });
+        return;
+      }
+      updates.basePrice = value;
+    } else if (key === "image") {
+      if (typeof value !== "string" || !isImgBbImageUrl(value)) {
+        response.status(400).json({ message: "Image must be an HTTPS ImgBB image URL" });
+        return;
+      }
+      updates.image = value;
+    }
+  }
+
+  const technicianId = (response.locals.authUser as { id: string }).id;
+  const service = await mongoDatabase.collection("services").findOneAndUpdate(
+    ownedServiceFilter(id, technicianId),
+    { $set: { ...updates, approvalStatus: "pending" } },
+    { returnDocument: "after" },
+  );
+  if (!service) {
+    response.status(404).json({ message: "Service not found" });
+    return;
+  }
+  response.json(service);
+});
+
+app.patch("/api/services/:id/availability", verifyToken, verifyTechnician, async (request, response) => {
+  const { id } = request.params;
+  if (typeof id !== "string" || !ObjectId.isValid(id)) {
+    response.status(404).json({ message: "Service not found" });
+    return;
+  }
+
+  const body: unknown = request.body;
+  if (!body || typeof body !== "object" || Array.isArray(body) ||
+    Object.keys(body).length !== 1 || typeof (body as Record<string, unknown>).isAvailable !== "boolean") {
+    response.status(400).json({ message: "isAvailable must be a boolean" });
+    return;
+  }
+
+  const technicianId = (response.locals.authUser as { id: string }).id;
+  const service = await mongoDatabase.collection("services").findOneAndUpdate(
+    ownedServiceFilter(id, technicianId),
+    { $set: { isAvailable: (body as { isAvailable: boolean }).isAvailable } },
+    { returnDocument: "after" },
+  );
+  if (!service) {
+    response.status(404).json({ message: "Service not found" });
+    return;
+  }
+  response.json(service);
+});
+
+app.delete("/api/services/:id", verifyToken, verifyTechnician, async (request, response) => {
+  const { id } = request.params;
+  if (typeof id !== "string" || !ObjectId.isValid(id)) {
+    response.status(404).json({ message: "Service not found" });
+    return;
+  }
+
+  const technicianId = (response.locals.authUser as { id: string }).id;
+  const result = await mongoDatabase.collection("services").deleteOne(ownedServiceFilter(id, technicianId));
+  if (!result.deletedCount) {
+    response.status(404).json({ message: "Service not found" });
+    return;
+  }
+  response.status(204).send();
+});
+
 app.get("/api/services/:id", async (request, response) => {
   const { id } = request.params;
 
