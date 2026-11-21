@@ -232,6 +232,17 @@ app.get("/api/services", async (request, response) => {
   response.json(services);
 });
 
+app.get("/api/services/my", verifyToken, verifyTechnician, async (_request, response) => {
+  const technicianId = (response.locals.authUser as { id: string }).id;
+  const services = await mongoDatabase
+    .collection("services")
+    .find({ technicianId: { $in: [technicianId, new ObjectId(technicianId)] } })
+    .sort({ createdAt: -1 })
+    .toArray();
+
+  response.json(services);
+});
+
 app.get("/api/services/:id", async (request, response) => {
   const { id } = request.params;
 
