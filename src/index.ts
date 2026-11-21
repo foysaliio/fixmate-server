@@ -4,7 +4,7 @@ import { ObjectId, type Document, type Filter, type Sort } from "mongodb";
 import { auth } from "./lib/auth.ts";
 import { mongoClient, mongoDatabase } from "./lib/mongodb.ts";
 import { createAccessToken } from "./lib/access-token.ts";
-import { verifyToken } from "./middleware/auth.ts";
+import { verifyTechnician, verifyToken } from "./middleware/auth.ts";
 import { parseImage, uploadImage } from "./routes/upload-image.ts";
 
 const app = express();
@@ -108,6 +108,79 @@ app.patch("/api/users/profile", verifyToken, async (request, response) => {
     bio: user.bio ?? "",
     image: user.image ?? null,
   });
+});
+
+const serviceCategories = new Set([
+  "Smartphone",
+  "Laptop & PC",
+  "AC",
+  "Refrigerator",
+  "TV",
+  "Washing Machine",
+  "Electrical",
+]);
+const serviceModes = new Set(["Home Visit", "Workshop"]);
+
+app.post("/api/services", verifyToken, verifyTechnician, async (request, response) => {
+  const body: unknown = request.body;
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    response.status(400).json({ message: "Invalid service data" });
+    return;
+  }
+
+  const input = body as Record<string, unknown>;
+  const requiredText = ["title", "description", "estimatedDuration", "serviceArea"] as const;
+  for (const field of requiredText) {
+    if (typeof input[field] !== "string" || !input[field].trim()) {
+      response.status(400).json({ message: `${field} is required` });
+      return;
+    }
+  }
+  if (typeof input.category !== "string" || !serviceCategories.has(input.category)) {
+    response.status(400).json({ message: "Invalid category" });
+    return;
+  }
+  if (typeof input.serviceMode !== "string" || !serviceModes.has(input.serviceMode)) {
+    response.status(400).json({ message: "Invalid serviceMode" });
+    return;
+  }
+  if (typeof input.basePrice !== "number" || !Number.isFinite(input.basePrice) || input.basePrice <= 0) {
+    response.status(400).json({ message: "basePrice must be greater than 0" });
+    return;
+  }
+  if (typeof input.image !== "string" || !isImgBbImageUrl(input.image)) {
+    response.status(400).json({ message: "Image must be an HTTPS ImgBB image URL" });
+    return;
+  }
+
+  const technicianId = (response.locals.authUser as { id: string }).id;
+  const technician = await mongoDatabase.collection("users").findOne(
+    { _id: new ObjectId(technicianId), role: "technician" },
+    { projection: { name: 1, email: 1 } },
+  );
+  if (!technician) {
+    response.status(403).json({ message: "Forbidden" });
+    return;
+  }
+
+  const service = {
+    title: (input.title as string).trim(),
+    description: (input.description as string).trim(),
+    category: input.category,
+    basePrice: input.basePrice,
+    estimatedDuration: (input.estimatedDuration as string).trim(),
+    serviceMode: input.serviceMode,
+    serviceArea: (input.serviceArea as string).trim(),
+    image: input.image,
+    technicianId,
+    technicianName: technician.name,
+    technicianEmail: technician.email,
+    approvalStatus: "pending",
+    isAvailable: true,
+    createdAt: new Date(),
+  };
+  const result = await mongoDatabase.collection("services").insertOne(service);
+  response.status(201).json({ _id: result.insertedId, ...service });
 });
 
 app.get("/api/services", async (request, response) => {
