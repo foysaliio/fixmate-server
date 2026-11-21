@@ -1,4 +1,5 @@
 import express from "express";
+import type { Document, Filter, Sort } from "mongodb";
 import { mongoClient, mongoDatabase } from "./lib/mongodb.ts";
 
 const app = express();
@@ -8,11 +9,39 @@ app.get("/api/health", (_request, response) => {
   response.json({ status: "ok" });
 });
 
-app.get("/api/services", async (_request, response) => {
+app.get("/api/services", async (request, response) => {
+  const filter: Filter<Document> = {
+    approvalStatus: "approved",
+    isAvailable: true,
+  };
+
+  const search = typeof request.query.search === "string" ? request.query.search.trim() : "";
+
+  if (search) {
+    const escapedSearch = search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const pattern = new RegExp(escapedSearch, "i");
+    filter.$or = [{ title: pattern }, { category: pattern }];
+  }
+
+  if (typeof request.query.category === "string" && request.query.category) {
+    filter.category = request.query.category;
+  }
+
+  if (typeof request.query.serviceMode === "string" && request.query.serviceMode) {
+    filter.serviceMode = request.query.serviceMode;
+  }
+
+  const sort: Sort =
+    request.query.sort === "price-asc"
+      ? { basePrice: 1 }
+      : request.query.sort === "price-desc"
+        ? { basePrice: -1 }
+        : { createdAt: -1 };
+
   const services = await mongoDatabase
     .collection("services")
-    .find({ approvalStatus: "approved", isAvailable: true })
-    .sort({ createdAt: -1 })
+    .find(filter)
+    .sort(sort)
     .toArray();
 
   response.json(services);
