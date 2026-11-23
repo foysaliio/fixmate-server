@@ -4,7 +4,7 @@ import { ObjectId, type Document, type Filter, type Sort } from "mongodb";
 import { auth } from "./lib/auth.ts";
 import { mongoClient, mongoDatabase } from "./lib/mongodb.ts";
 import { createAccessToken } from "./lib/access-token.ts";
-import { verifyTechnician, verifyToken } from "./middleware/auth.ts";
+import { verifyAdmin, verifyTechnician, verifyToken } from "./middleware/auth.ts";
 import { parseImage, uploadImage } from "./routes/upload-image.ts";
 
 const app = express();
@@ -390,6 +390,46 @@ app.get("/api/services/:id", async (request, response) => {
     return;
   }
 
+  response.json(service);
+});
+
+const adminServiceStatuses = new Set(["pending", "approved", "rejected", "all"]);
+
+app.get("/api/admin/services", verifyToken, verifyAdmin, async (request, response) => {
+  const status = request.query.status === undefined ? "pending" : request.query.status;
+  if (typeof status !== "string" || !adminServiceStatuses.has(status)) {
+    response.status(400).json({ message: "Invalid status" });
+    return;
+  }
+
+  const filter = status === "all" ? {} : { approvalStatus: status };
+  const services = await mongoDatabase.collection("services").find(filter).sort({ createdAt: -1 }).toArray();
+  response.json(services);
+});
+
+app.patch("/api/admin/services/:id/approval", verifyToken, verifyAdmin, async (request, response) => {
+  const { id } = request.params;
+  if (typeof id !== "string" || !ObjectId.isValid(id)) {
+    response.status(404).json({ message: "Service not found" });
+    return;
+  }
+
+  const body: unknown = request.body;
+  if (!body || typeof body !== "object" || Array.isArray(body) ||
+    Object.keys(body).length !== 1 || !["approved", "rejected"].includes((body as Record<string, unknown>).approvalStatus as string)) {
+    response.status(400).json({ message: "approvalStatus must be approved or rejected" });
+    return;
+  }
+
+  const service = await mongoDatabase.collection("services").findOneAndUpdate(
+    { _id: new ObjectId(id) },
+    { $set: { approvalStatus: (body as { approvalStatus: "approved" | "rejected" }).approvalStatus } },
+    { returnDocument: "after" },
+  );
+  if (!service) {
+    response.status(404).json({ message: "Service not found" });
+    return;
+  }
   response.json(service);
 });
 
