@@ -1,10 +1,10 @@
 import express from "express";
 import { fromNodeHeaders, toNodeHandler } from "better-auth/node";
-import { ObjectId, type Document, type Filter, type Sort } from "mongodb";
+import { MongoServerError, ObjectId, type Document, type Filter, type Sort } from "mongodb";
 import { auth } from "./lib/auth.ts";
 import { mongoClient, mongoDatabase } from "./lib/mongodb.ts";
 import { createAccessToken } from "./lib/access-token.ts";
-import { verifyAdmin, verifyTechnician, verifyToken } from "./middleware/auth.ts";
+import { verifyAdmin, verifyCustomer, verifyTechnician, verifyToken } from "./middleware/auth.ts";
 import { parseImage, uploadImage } from "./routes/upload-image.ts";
 
 const app = express();
@@ -393,6 +393,120 @@ app.get("/api/services/:id", async (request, response) => {
   response.json(service);
 });
 
+const activeBookingStatuses = ["requested", "accepted", "in-progress"];
+
+async function ensureBookingIndex() {
+  await mongoDatabase.collection("bookings").createIndex(
+    { customerId: 1, serviceId: 1 },
+    {
+      name: "unique_active_customer_service_booking",
+      unique: true,
+      partialFilterExpression: { status: { $in: activeBookingStatuses } },
+    },
+  );
+}
+
+app.post("/api/bookings", verifyToken, verifyCustomer, async (request, response) => {
+  const body: unknown = request.body;
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    response.status(400).json({ message: "Invalid booking data" });
+    return;
+  }
+
+  const input = body as Record<string, unknown>;
+  if (typeof input.serviceId !== "string" || !/^[0-9a-fA-F]{24}$/.test(input.serviceId)) {
+    response.status(400).json({ message: "Invalid serviceId" });
+    return;
+  }
+  for (const field of ["phone", "address"] as const) {
+    if (typeof input[field] !== "string" || !input[field].trim()) {
+      response.status(400).json({ message: `${field} is required` });
+      return;
+    }
+  }
+  const phone = (input.phone as string).trim();
+  if (!/^\+?[\d\s()-]+$/.test(phone) || !/^\d{7,15}$/.test(phone.replace(/\D/g, ""))) {
+    response.status(400).json({ message: "Invalid phone" });
+    return;
+  }
+  if (typeof input.problemDescription !== "string" || input.problemDescription.trim().length < 20) {
+    response.status(400).json({ message: "problemDescription must be at least 20 characters" });
+    return;
+  }
+  const preferredDate = input.preferredDate;
+  const today = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Dhaka", year: "numeric", month: "2-digit", day: "2-digit",
+  }).format(new Date());
+  if (typeof preferredDate !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(preferredDate) ||
+    Number.isNaN(Date.parse(`${preferredDate}T00:00:00Z`)) ||
+    new Date(`${preferredDate}T00:00:00Z`).toISOString().slice(0, 10) !== preferredDate ||
+    preferredDate < today) {
+    response.status(400).json({ message: "preferredDate must be today or a future date (YYYY-MM-DD)" });
+    return;
+  }
+
+  const customerId = (response.locals.authUser as { id: string }).id;
+  const customer = await mongoDatabase.collection("users").findOne(
+    { _id: new ObjectId(customerId), role: "customer" },
+    { projection: { name: 1, email: 1 } },
+  );
+  if (!customer) {
+    response.status(403).json({ message: "Forbidden" });
+    return;
+  }
+
+  const serviceId = new ObjectId(input.serviceId);
+  const service = await mongoDatabase.collection("services").findOne({
+    _id: serviceId, approvalStatus: "approved", isAvailable: true,
+  });
+  if (!service) {
+    response.status(404).json({ message: "Service not found" });
+    return;
+  }
+
+  const bookings = mongoDatabase.collection("bookings");
+  const bookingKey = { customerId, serviceId: serviceId.toHexString() };
+  if (await bookings.findOne({ ...bookingKey, status: { $in: activeBookingStatuses } }, { projection: { _id: 1 } })) {
+    response.status(409).json({ message: "An active booking already exists for this service" });
+    return;
+  }
+
+  const booking = {
+    ...bookingKey,
+    customerName: customer.name,
+    customerEmail: customer.email,
+    phone,
+    address: (input.address as string).trim(),
+    preferredDate,
+    problemDescription: input.problemDescription.trim(),
+    serviceTitle: service.title,
+    serviceDescription: service.description,
+    serviceCategory: service.category,
+    serviceMode: service.serviceMode,
+    serviceArea: service.serviceArea,
+    serviceImage: service.image,
+    estimatedDuration: service.estimatedDuration,
+    basePrice: service.basePrice,
+    technicianId: service.technicianId,
+    technicianName: service.technicianName,
+    technicianEmail: service.technicianEmail,
+    status: "requested",
+    paymentStatus: "unpaid",
+    finalAmount: service.basePrice,
+    createdAt: new Date(),
+  };
+  try {
+    const result = await bookings.insertOne(booking);
+    response.status(201).json({ _id: result.insertedId, ...booking });
+  } catch (error) {
+    if (error instanceof MongoServerError && error.code === 11000) {
+      response.status(409).json({ message: "An active booking already exists for this service" });
+      return;
+    }
+    throw error;
+  }
+});
+
 const adminServiceStatuses = new Set(["pending", "approved", "rejected", "all"]);
 
 app.get("/api/admin/services", verifyToken, verifyAdmin, async (request, response) => {
@@ -439,6 +553,8 @@ async function startServer() {
     await mongoDatabase.command({ ping: 1 });
     console.log("MongoDB ping succeeded.");
 
+    await ensureBookingIndex();
+
     app.listen(port, () => {
       console.log(`FixMate server listening on http://localhost:${port}`);
     });
@@ -449,4 +565,8 @@ async function startServer() {
   }
 }
 
-void startServer();
+if (process.env.NODE_ENV !== "test") {
+  void startServer();
+}
+
+export { app, ensureBookingIndex };

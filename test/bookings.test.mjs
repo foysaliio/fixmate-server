@@ -1,0 +1,145 @@
+import assert from "node:assert/strict";
+import { after, before, test } from "node:test";
+import { ObjectId, MongoServerError } from "mongodb";
+
+process.env.NODE_ENV = "test";
+const [{ app, ensureBookingIndex }, { mongoDatabase }, { createAccessToken }] = await Promise.all([
+  import("../dist/index.js"),
+  import("../dist/lib/mongodb.js"),
+  import("../dist/lib/access-token.js"),
+]);
+
+const customerId = new ObjectId();
+const technicianId = new ObjectId();
+const serviceId = new ObjectId();
+const users = [
+  { _id: customerId, role: "customer", name: "Real Customer", email: "customer@example.com" },
+  { _id: technicianId, role: "technician", name: "Real Technician", email: "tech@example.com" },
+];
+const service = {
+  _id: serviceId, approvalStatus: "approved", isAvailable: true, title: "AC repair",
+  description: "Repair an AC", category: "AC", serviceMode: "Home Visit", serviceArea: "Dhaka",
+  image: "https://i.ibb.co/example", estimatedDuration: "2 hours", basePrice: 1200,
+  technicianId: technicianId.toHexString(), technicianName: "Real Technician", technicianEmail: "tech@example.com",
+};
+const saved = [];
+let indexSpec;
+let raceGate;
+let releaseRace;
+let racingLookups = 0;
+const originalCollection = mongoDatabase.collection;
+mongoDatabase.collection = (name) => {
+  if (name === "users") return {
+    findOne: async (filter) => users.find((user) => user._id.equals(filter._id) && (!filter.role || user.role === filter.role)) ?? null,
+  };
+  if (name === "services") return {
+    findOne: async (filter) => service._id.equals(filter._id) && service.approvalStatus === filter.approvalStatus && service.isAvailable === filter.isAvailable ? service : null,
+  };
+  if (name === "bookings") return {
+    createIndex: async (keys, options) => { indexSpec = { keys, options }; },
+    findOne: async (filter) => {
+      const found = saved.find((booking) => booking.customerId === filter.customerId && booking.serviceId === filter.serviceId && filter.status.$in.includes(booking.status)) ?? null;
+      if (raceGate) {
+        racingLookups += 1;
+        if (racingLookups === 2) releaseRace();
+        await raceGate;
+      }
+      return found;
+    },
+    insertOne: async (booking) => {
+      // Simulate the partial unique index when simultaneous requests both pass findOne.
+      if (saved.some((item) => item.customerId === booking.customerId && item.serviceId === booking.serviceId && ["requested", "accepted", "in-progress"].includes(item.status))) {
+        throw new MongoServerError({ ok: 0, code: 11000, errmsg: "duplicate key" });
+      }
+      const insertedId = new ObjectId();
+      saved.push({ _id: insertedId, ...booking });
+      return { insertedId };
+    },
+  };
+  throw new Error(`Unexpected collection: ${name}`);
+};
+
+let server;
+let url;
+let customerToken;
+let technicianToken;
+before(async () => {
+  server = app.listen(0);
+  await new Promise((resolve) => server.once("listening", resolve));
+  url = `http://127.0.0.1:${server.address().port}/api/bookings`;
+  [customerToken, technicianToken] = await Promise.all([
+    createAccessToken(customerId.toHexString()),
+    createAccessToken(technicianId.toHexString()),
+  ]);
+});
+after(async () => {
+  await new Promise((resolve) => server.close(resolve));
+  mongoDatabase.collection = originalCollection;
+});
+
+const payload = () => ({
+  serviceId: serviceId.toHexString(), phone: "01700000000", address: "Dhaka",
+  preferredDate: new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Dhaka", year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date()),
+  problemDescription: "The AC is not cooling properly.",
+  customerName: "Forged name", customerEmail: "forged@example.com", finalAmount: 1,
+});
+async function post(body, token = customerToken) {
+  const response = await fetch(url, {
+    method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+    body: JSON.stringify(body),
+  });
+  return { status: response.status, body: await response.json() };
+}
+
+test("partial unique index covers all active booking statuses", async () => {
+  await ensureBookingIndex();
+  assert.deepEqual(indexSpec.keys, { customerId: 1, serviceId: 1 });
+  assert.equal(indexSpec.options.unique, true);
+  assert.deepEqual(indexSpec.options.partialFilterExpression.status.$in, ["requested", "accepted", "in-progress"]);
+});
+
+test("invalid input and wrong role are rejected", async () => {
+  assert.equal((await post({ ...payload(), serviceId: "bad" })).status, 400);
+  assert.equal((await post({ ...payload(), preferredDate: "2020-01-01" })).status, 400);
+  assert.equal((await post({ ...payload(), preferredDate: "2026-02-30" })).status, 400);
+  assert.equal((await post({ ...payload(), problemDescription: "Too short" })).status, 400);
+  assert.equal((await post({ ...payload(), address: " " })).status, 400);
+  assert.equal((await post({ ...payload(), phone: "abc" })).status, 400);
+  assert.equal((await post(payload(), technicianToken)).status, 403);
+  assert.equal((await post(payload(), "invalid")).status, 401);
+  assert.equal(saved.length, 0);
+});
+
+test("only approved and available services can be booked", async () => {
+  service.approvalStatus = "pending";
+  assert.equal((await post(payload())).status, 404);
+  service.approvalStatus = "approved";
+  service.isAvailable = false;
+  assert.equal((await post(payload())).status, 404);
+  service.isAvailable = true;
+  assert.equal(saved.length, 0);
+});
+
+test("successful booking uses trusted customer and service data", async () => {
+  const result = await post(payload());
+  assert.equal(result.status, 201);
+  assert.equal(result.body.customerName, "Real Customer");
+  assert.equal(result.body.customerEmail, "customer@example.com");
+  assert.equal(result.body.technicianName, "Real Technician");
+  assert.equal(result.body.status, "requested");
+  assert.equal(result.body.paymentStatus, "unpaid");
+  assert.equal(result.body.finalAmount, 1200);
+  assert.equal(saved.length, 1);
+  assert.equal((await post(payload())).status, 409);
+});
+
+test("concurrent submissions save one booking and return 409 for the other", async () => {
+  saved.length = 0;
+  racingLookups = 0;
+  raceGate = new Promise((resolve) => { releaseRace = resolve; });
+  const results = await Promise.all([post(payload()), post(payload())]);
+  raceGate = undefined;
+  assert.equal(racingLookups, 2);
+  assert.deepEqual(results.map((result) => result.status).sort(), [201, 409]);
+  assert.equal(saved.length, 1);
+});
