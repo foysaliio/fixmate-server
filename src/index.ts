@@ -4,6 +4,7 @@ import { MongoServerError, ObjectId, type Document, type Filter, type Sort } fro
 import { auth } from "./lib/auth.ts";
 import { mongoClient, mongoDatabase } from "./lib/mongodb.ts";
 import { createAccessToken } from "./lib/access-token.ts";
+import { getStripeClient } from "./lib/stripe.ts";
 import { verifyAdmin, verifyCustomer, verifyTechnician, verifyToken } from "./middleware/auth.ts";
 import { parseImage, uploadImage } from "./routes/upload-image.ts";
 
@@ -604,6 +605,125 @@ app.patch("/api/bookings/:id/status", verifyToken, verifyTechnician, async (requ
     return;
   }
   response.json(booking);
+});
+
+app.post("/api/payments/create-checkout-session", verifyToken, verifyCustomer, async (request, response) => {
+  const body: unknown = request.body;
+  if (!body || typeof body !== "object" || Array.isArray(body) ||
+    Object.keys(body).length !== 1 || typeof (body as Record<string, unknown>).bookingId !== "string" ||
+    !ObjectId.isValid((body as { bookingId: string }).bookingId)) {
+    response.status(400).json({ message: "A valid bookingId is required" });
+    return;
+  }
+
+  const stripe = getStripeClient();
+  const clientUrl = process.env.CLIENT_URL;
+  if (!stripe || !clientUrl) {
+    response.status(503).json({ message: "Payment checkout is not configured" });
+    return;
+  }
+  let clientOrigin: URL;
+  try {
+    clientOrigin = new URL(clientUrl);
+    if (!["https:", "http:"].includes(clientOrigin.protocol) || clientOrigin.username || clientOrigin.password) {
+      throw new Error("Invalid client URL");
+    }
+  } catch {
+    response.status(503).json({ message: "Payment checkout is not configured" });
+    return;
+  }
+
+  const bookingId = (body as { bookingId: string }).bookingId;
+  const customerId = (response.locals.authUser as { id: string }).id;
+  const bookings = mongoDatabase.collection("bookings");
+  const eligibility = {
+    _id: new ObjectId(bookingId), customerId, status: "completed", paymentStatus: "unpaid",
+  };
+  const booking = await bookings.findOne(eligibility);
+  if (!booking) {
+    response.status(404).json({ message: "Eligible booking not found" });
+    return;
+  }
+
+  const finalAmount = booking.finalAmount;
+  const cents = typeof finalAmount === "number" && Number.isFinite(finalAmount)
+    ? Math.round(finalAmount * 100)
+    : 0;
+  if (!Number.isSafeInteger(cents) || cents <= 0 ||
+    typeof booking.customerEmail !== "string" || !booking.customerEmail.trim()) {
+    response.status(409).json({ message: "Booking payment details are invalid" });
+    return;
+  }
+
+  let attempt = typeof booking.checkoutAttempt === "number" && Number.isSafeInteger(booking.checkoutAttempt)
+    ? booking.checkoutAttempt
+    : 0;
+  let attemptFilter: number | { $exists: false } = typeof booking.checkoutAttempt === "number"
+    ? booking.checkoutAttempt
+    : { $exists: false };
+  if (typeof booking.checkoutSessionId === "string" && booking.checkoutSessionId) {
+    const existing = await stripe.checkout.sessions.retrieve(booking.checkoutSessionId);
+    if (existing.status === "open" && existing.url && existing.expires_at > Math.floor(Date.now() / 1000)) {
+      if (existing.amount_total !== cents || existing.currency !== "usd" ||
+        existing.metadata?.bookingId !== bookingId || existing.metadata?.customerEmail !== booking.customerEmail) {
+        response.status(409).json({ message: "Checkout details do not match this booking" });
+        return;
+      }
+      response.json({ url: existing.url });
+      return;
+    }
+    if (existing.status === "complete") {
+      response.status(409).json({ message: "Payment is already being processed" });
+      return;
+    }
+
+    const refreshed = await bookings.findOneAndUpdate(
+      { ...eligibility, checkoutSessionId: booking.checkoutSessionId },
+      { $inc: { checkoutAttempt: 1 }, $unset: { checkoutSessionId: "" } },
+      { returnDocument: "after" },
+    );
+    if (!refreshed) {
+      response.status(409).json({ message: "Checkout changed. Please try again." });
+      return;
+    }
+    attempt = refreshed.checkoutAttempt as number;
+    attemptFilter = attempt;
+  }
+
+  const session = await stripe.checkout.sessions.create({
+    mode: "payment",
+    customer_email: booking.customerEmail,
+    line_items: [{
+      price_data: {
+        currency: "usd",
+        unit_amount: cents,
+        product_data: { name: typeof booking.serviceTitle === "string" && booking.serviceTitle.trim() ? booking.serviceTitle : "FixMate repair" },
+      },
+      quantity: 1,
+    }],
+    metadata: { bookingId, customerEmail: booking.customerEmail },
+    success_url: new URL("/payment/success?session_id={CHECKOUT_SESSION_ID}", clientOrigin).toString(),
+    cancel_url: new URL("/payment/cancel", clientOrigin).toString(),
+  }, { idempotencyKey: `fixmate-booking-${bookingId}-attempt-${attempt}` });
+  if (session.status !== "open" || !session.url) {
+    response.status(502).json({ message: "Checkout is unavailable" });
+    return;
+  }
+
+  const saved = await bookings.updateOne(
+    { ...eligibility, checkoutSessionId: { $exists: false }, checkoutAttempt: attemptFilter },
+    { $set: { checkoutSessionId: session.id } },
+  );
+  if (!saved.matchedCount) {
+    const current = await bookings.findOne(eligibility);
+    if (current?.checkoutSessionId === session.id) {
+      response.json({ url: session.url });
+      return;
+    }
+    response.status(409).json({ message: "Checkout changed. Please try again." });
+    return;
+  }
+  response.json({ url: session.url });
 });
 
 const adminServiceStatuses = new Set(["pending", "approved", "rejected", "all"]);
