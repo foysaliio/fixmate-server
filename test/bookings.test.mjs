@@ -10,10 +10,12 @@ const [{ app, ensureBookingIndex }, { mongoDatabase }, { createAccessToken }] = 
 ]);
 
 const customerId = new ObjectId();
+const secondCustomerId = new ObjectId();
 const technicianId = new ObjectId();
 const serviceId = new ObjectId();
 const users = [
   { _id: customerId, role: "customer", name: "Real Customer", email: "customer@example.com" },
+  { _id: secondCustomerId, role: "customer", name: "Second Customer", email: "second@example.com" },
   { _id: technicianId, role: "technician", name: "Real Technician", email: "tech@example.com" },
 ];
 const service = {
@@ -37,6 +39,15 @@ mongoDatabase.collection = (name) => {
   };
   if (name === "bookings") return {
     createIndex: async (keys, options) => { indexSpec = { keys, options }; },
+    find: (filter) => ({
+      sort: (order) => ({
+        toArray: async () => {
+          assert.deepEqual(order, { createdAt: -1 });
+          return saved.filter((booking) => booking.customerId === filter.customerId)
+            .sort((a, b) => b.createdAt - a.createdAt);
+        },
+      }),
+    }),
     findOne: async (filter) => {
       const found = saved.find((booking) => booking.customerId === filter.customerId && booking.serviceId === filter.serviceId && filter.status.$in.includes(booking.status)) ?? null;
       if (raceGate) {
@@ -62,13 +73,15 @@ mongoDatabase.collection = (name) => {
 let server;
 let url;
 let customerToken;
+let secondCustomerToken;
 let technicianToken;
 before(async () => {
   server = app.listen(0);
   await new Promise((resolve) => server.once("listening", resolve));
   url = `http://127.0.0.1:${server.address().port}/api/bookings`;
-  [customerToken, technicianToken] = await Promise.all([
+  [customerToken, secondCustomerToken, technicianToken] = await Promise.all([
     createAccessToken(customerId.toHexString()),
+    createAccessToken(secondCustomerId.toHexString()),
     createAccessToken(technicianId.toHexString()),
   ]);
 });
@@ -142,4 +155,28 @@ test("concurrent submissions save one booking and return 409 for the other", asy
   assert.equal(racingLookups, 2);
   assert.deepEqual(results.map((result) => result.status).sort(), [201, 409]);
   assert.equal(saved.length, 1);
+});
+
+test("two customers can each read only their own bookings", async () => {
+  saved.length = 0;
+  saved.push(
+    { _id: new ObjectId(), customerId: customerId.toHexString(), serviceId: "first-service", createdAt: new Date("2026-11-24") },
+    { _id: new ObjectId(), customerId: secondCustomerId.toHexString(), serviceId: "second-service", createdAt: new Date("2026-11-25") },
+    { _id: new ObjectId(), customerId: customerId.toHexString(), serviceId: "newer-first-service", createdAt: new Date("2026-11-26") },
+  );
+
+  async function getMine(token) {
+    const response = await fetch(`${url}/my`, { headers: { authorization: `Bearer ${token}` } });
+    return { status: response.status, body: await response.json() };
+  }
+  const [first, second, technician, guest] = await Promise.all([
+    getMine(customerToken), getMine(secondCustomerToken), getMine(technicianToken),
+    fetch(`${url}/my`).then(async (response) => ({ status: response.status, body: await response.json() })),
+  ]);
+  assert.equal(first.status, 200);
+  assert.deepEqual(first.body.map((booking) => booking.serviceId), ["newer-first-service", "first-service"]);
+  assert.equal(second.status, 200);
+  assert.deepEqual(second.body.map((booking) => booking.serviceId), ["second-service"]);
+  assert.equal(technician.status, 403);
+  assert.equal(guest.status, 401);
 });

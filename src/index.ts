@@ -507,6 +507,15 @@ app.post("/api/bookings", verifyToken, verifyCustomer, async (request, response)
   }
 });
 
+app.get("/api/bookings/my", verifyToken, verifyCustomer, async (_request, response) => {
+  const customerId = (response.locals.authUser as { id: string }).id;
+  const bookings = await mongoDatabase.collection("bookings")
+    .find({ customerId })
+    .sort({ createdAt: -1 })
+    .toArray();
+  response.json(bookings);
+});
+
 const adminServiceStatuses = new Set(["pending", "approved", "rejected", "all"]);
 
 app.get("/api/admin/services", verifyToken, verifyAdmin, async (request, response) => {
