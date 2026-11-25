@@ -516,6 +516,26 @@ app.get("/api/bookings/my", verifyToken, verifyCustomer, async (_request, respon
   response.json(bookings);
 });
 
+app.patch("/api/bookings/:id/cancel", verifyToken, verifyCustomer, async (request, response) => {
+  const { id } = request.params;
+  if (typeof id !== "string" || !ObjectId.isValid(id)) {
+    response.status(404).json({ message: "Booking not found or cannot be cancelled" });
+    return;
+  }
+
+  const customerId = (response.locals.authUser as { id: string }).id;
+  const booking = await mongoDatabase.collection("bookings").findOneAndUpdate(
+    { _id: new ObjectId(id), customerId, status: "requested" },
+    { $set: { status: "cancelled" } },
+    { returnDocument: "after" },
+  );
+  if (!booking) {
+    response.status(404).json({ message: "Booking not found or cannot be cancelled" });
+    return;
+  }
+  response.json(booking);
+});
+
 const adminServiceStatuses = new Set(["pending", "approved", "rejected", "all"]);
 
 app.get("/api/admin/services", verifyToken, verifyAdmin, async (request, response) => {

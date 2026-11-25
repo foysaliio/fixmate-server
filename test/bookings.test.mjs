@@ -57,6 +57,15 @@ mongoDatabase.collection = (name) => {
       }
       return found;
     },
+    findOneAndUpdate: async (filter, update, options) => {
+      assert.equal(filter.status, "requested");
+      assert.deepEqual(update, { $set: { status: "cancelled" } });
+      assert.equal(options.returnDocument, "after");
+      const booking = saved.find((item) => item._id.equals(filter._id) && item.customerId === filter.customerId && item.status === filter.status);
+      if (!booking) return null;
+      booking.status = update.$set.status;
+      return booking;
+    },
     insertOne: async (booking) => {
       // Simulate the partial unique index when simultaneous requests both pass findOne.
       if (saved.some((item) => item.customerId === booking.customerId && item.serviceId === booking.serviceId && ["requested", "accepted", "in-progress"].includes(item.status))) {
@@ -179,4 +188,35 @@ test("two customers can each read only their own bookings", async () => {
   assert.deepEqual(second.body.map((booking) => booking.serviceId), ["second-service"]);
   assert.equal(technician.status, 403);
   assert.equal(guest.status, 401);
+});
+
+test("customer cancels their own requested booking", async () => {
+  const booking = { _id: new ObjectId(), customerId: customerId.toHexString(), status: "requested" };
+  saved.push(booking);
+  const response = await fetch(`${url}/${booking._id}/cancel`, {
+    method: "PATCH", headers: { authorization: `Bearer ${customerToken}` },
+  });
+  assert.equal(response.status, 200);
+  assert.equal((await response.json()).status, "cancelled");
+  assert.equal(booking.status, "cancelled");
+});
+
+test("customer cannot cancel another customer's requested booking", async () => {
+  const booking = { _id: new ObjectId(), customerId: secondCustomerId.toHexString(), status: "requested" };
+  saved.push(booking);
+  const response = await fetch(`${url}/${booking._id}/cancel`, {
+    method: "PATCH", headers: { authorization: `Bearer ${customerToken}` },
+  });
+  assert.equal(response.status, 404);
+  assert.equal(booking.status, "requested");
+});
+
+test("customer cannot cancel an accepted booking", async () => {
+  const booking = { _id: new ObjectId(), customerId: customerId.toHexString(), status: "accepted" };
+  saved.push(booking);
+  const response = await fetch(`${url}/${booking._id}/cancel`, {
+    method: "PATCH", headers: { authorization: `Bearer ${customerToken}` },
+  });
+  assert.equal(response.status, 404);
+  assert.equal(booking.status, "accepted");
 });
