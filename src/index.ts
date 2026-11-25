@@ -554,6 +554,58 @@ app.patch("/api/bookings/:id/cancel", verifyToken, verifyCustomer, async (reques
   response.json(booking);
 });
 
+const previousBookingStatus: Record<string, string> = {
+  accepted: "requested",
+  rejected: "requested",
+  "in-progress": "accepted",
+  completed: "in-progress",
+};
+
+app.patch("/api/bookings/:id/status", verifyToken, verifyTechnician, async (request, response) => {
+  const { id } = request.params;
+  if (typeof id !== "string" || !ObjectId.isValid(id)) {
+    response.status(404).json({ message: "Booking not found or status cannot be changed" });
+    return;
+  }
+
+  const body: unknown = request.body;
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    response.status(400).json({ message: "Invalid booking status data" });
+    return;
+  }
+  const input = body as Record<string, unknown>;
+  const nextStatus = input.status;
+  if (typeof nextStatus !== "string" || !Object.hasOwn(previousBookingStatus, nextStatus) ||
+    Object.keys(input).some((key) => key !== "status" && key !== "finalAmount")) {
+    response.status(400).json({ message: "Invalid booking status data" });
+    return;
+  }
+  if (nextStatus === "completed") {
+    if (typeof input.finalAmount !== "number" || !Number.isFinite(input.finalAmount) || input.finalAmount <= 0) {
+      response.status(400).json({ message: "finalAmount must be a number greater than 0" });
+      return;
+    }
+  } else if (Object.hasOwn(input, "finalAmount")) {
+    response.status(400).json({ message: "finalAmount is only allowed when completing a booking" });
+    return;
+  }
+
+  const technicianId = (response.locals.authUser as { id: string }).id;
+  const update = nextStatus === "completed"
+    ? { status: nextStatus, finalAmount: input.finalAmount as number }
+    : { status: nextStatus };
+  const booking = await mongoDatabase.collection("bookings").findOneAndUpdate(
+    { _id: new ObjectId(id), technicianId, status: previousBookingStatus[nextStatus] },
+    { $set: update },
+    { returnDocument: "after" },
+  );
+  if (!booking) {
+    response.status(404).json({ message: "Booking not found or status cannot be changed" });
+    return;
+  }
+  response.json(booking);
+});
+
 const adminServiceStatuses = new Set(["pending", "approved", "rejected", "all"]);
 
 app.get("/api/admin/services", verifyToken, verifyAdmin, async (request, response) => {

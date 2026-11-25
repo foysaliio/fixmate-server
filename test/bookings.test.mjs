@@ -60,12 +60,15 @@ mongoDatabase.collection = (name) => {
       return found;
     },
     findOneAndUpdate: async (filter, update, options) => {
-      assert.equal(filter.status, "requested");
-      assert.deepEqual(update, { $set: { status: "cancelled" } });
       assert.equal(options.returnDocument, "after");
-      const booking = saved.find((item) => item._id.equals(filter._id) && item.customerId === filter.customerId && item.status === filter.status);
+      assert.deepEqual(Object.keys(filter).sort(),
+        update.$set.status === "cancelled"
+          ? ["_id", "customerId", "status"]
+          : ["_id", "status", "technicianId"]);
+      const booking = saved.find((item) => Object.entries(filter).every(([key, value]) =>
+        key === "_id" ? item._id.equals(value) : item[key] === value));
       if (!booking) return null;
-      booking.status = update.$set.status;
+      Object.assign(booking, update.$set);
       return booking;
     },
     insertOne: async (booking) => {
@@ -269,4 +272,94 @@ test("technician requests are scoped to the owner and filtered by status", async
   assert.equal((await getRequests(technicianToken, "cancelled")).status, 400);
   assert.equal((await getRequests(customerToken, "all")).status, 403);
   assert.equal((await getRequests(undefined, "all")).status, 401);
+});
+
+async function changeBookingStatus(id, body, token = technicianToken) {
+  const response = await fetch(`${url}/${id}/status`, {
+    method: "PATCH",
+    headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+    body: JSON.stringify(body),
+  });
+  return { status: response.status, body: await response.json() };
+}
+
+test("technician can follow every allowed status transition", async () => {
+  const booking = {
+    _id: new ObjectId(), technicianId: technicianId.toHexString(),
+    status: "requested", finalAmount: 1200,
+  };
+  const rejectedBooking = {
+    _id: new ObjectId(), technicianId: technicianId.toHexString(), status: "requested",
+  };
+  saved.push(booking, rejectedBooking);
+
+  assert.equal((await changeBookingStatus(booking._id, { status: "accepted" })).status, 200);
+  assert.equal(booking.status, "accepted");
+  assert.equal((await changeBookingStatus(booking._id, { status: "in-progress" })).status, 200);
+  assert.equal(booking.status, "in-progress");
+  const completed = await changeBookingStatus(booking._id, { status: "completed", finalAmount: 2750 });
+  assert.equal(completed.status, 200);
+  assert.equal(completed.body.status, "completed");
+  assert.equal(completed.body.finalAmount, 2750);
+  assert.equal(booking.finalAmount, 2750);
+
+  const rejected = await changeBookingStatus(rejectedBooking._id, { status: "rejected" });
+  assert.equal(rejected.status, 200);
+  assert.equal(rejected.body.status, "rejected");
+});
+
+test("technician cannot skip or reverse status steps", async () => {
+  const booking = { _id: new ObjectId(), technicianId: technicianId.toHexString(), status: "requested" };
+  saved.push(booking);
+  assert.equal((await changeBookingStatus(booking._id, { status: "in-progress" })).status, 404);
+  assert.equal((await changeBookingStatus(booking._id, { status: "completed", finalAmount: 500 })).status, 404);
+  assert.equal(booking.status, "requested");
+  assert.equal((await changeBookingStatus(booking._id, { status: "accepted" })).status, 200);
+  assert.equal((await changeBookingStatus(booking._id, { status: "completed", finalAmount: 500 })).status, 404);
+  assert.equal(booking.status, "accepted");
+  assert.equal((await changeBookingStatus(booking._id, { status: "in-progress" })).status, 200);
+  assert.equal((await changeBookingStatus(booking._id, { status: "accepted" })).status, 404);
+  assert.equal(booking.status, "in-progress");
+});
+
+test("technician cannot update another technician's booking", async () => {
+  const booking = { _id: new ObjectId(), technicianId: secondTechnicianId.toHexString(), status: "requested" };
+  saved.push(booking);
+  assert.equal((await changeBookingStatus(booking._id, { status: "accepted" })).status, 404);
+  assert.equal(booking.status, "requested");
+  assert.equal((await changeBookingStatus(booking._id, { status: "accepted" }, secondTechnicianToken)).status, 200);
+  assert.equal(booking.status, "accepted");
+});
+
+test("completion requires a positive numeric finalAmount", async () => {
+  const booking = {
+    _id: new ObjectId(), technicianId: technicianId.toHexString(),
+    status: "in-progress", finalAmount: 1200,
+  };
+  saved.push(booking);
+  for (const finalAmount of [undefined, null, "1500", 0, -1, Number.NaN]) {
+    const body = finalAmount === undefined ? { status: "completed" } : { status: "completed", finalAmount };
+    assert.equal((await changeBookingStatus(booking._id, body)).status, 400);
+    assert.equal(booking.status, "in-progress");
+    assert.equal(booking.finalAmount, 1200);
+  }
+  assert.equal((await changeBookingStatus(booking._id, { status: "completed", finalAmount: 0.5 })).status, 200);
+  assert.equal(booking.finalAmount, 0.5);
+});
+
+test("status endpoint rejects invalid input and other roles", async () => {
+  const booking = { _id: new ObjectId(), technicianId: technicianId.toHexString(), status: "requested" };
+  saved.push(booking);
+  assert.equal((await changeBookingStatus(booking._id, { status: "requested" })).status, 400);
+  assert.equal((await changeBookingStatus(booking._id, { status: "cancelled" })).status, 400);
+  assert.equal((await changeBookingStatus(booking._id, { status: "accepted", finalAmount: 100 })).status, 400);
+  assert.equal((await changeBookingStatus(booking._id, { status: "accepted", customerId: technicianId.toHexString() })).status, 400);
+  assert.equal((await changeBookingStatus("invalid", { status: "accepted" })).status, 404);
+  assert.equal((await changeBookingStatus(booking._id, { status: "accepted" }, customerToken)).status, 403);
+  const guest = await fetch(`${url}/${booking._id}/status`, {
+    method: "PATCH", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ status: "accepted" }),
+  });
+  assert.equal(guest.status, 401);
+  assert.equal(booking.status, "requested");
 });
