@@ -516,6 +516,24 @@ app.get("/api/bookings/my", verifyToken, verifyCustomer, async (_request, respon
   response.json(bookings);
 });
 
+const technicianBookingStatuses = new Set(["all", "requested", "accepted", "in-progress", "completed"]);
+
+app.get("/api/bookings/technician", verifyToken, verifyTechnician, async (request, response) => {
+  const status = request.query.status ?? "all";
+  if (typeof status !== "string" || !technicianBookingStatuses.has(status)) {
+    response.status(400).json({ message: "Invalid status" });
+    return;
+  }
+
+  const technicianId = (response.locals.authUser as { id: string }).id;
+  const filter = status === "all" ? { technicianId } : { technicianId, status };
+  const bookings = await mongoDatabase.collection("bookings")
+    .find(filter)
+    .sort({ createdAt: -1 })
+    .toArray();
+  response.json(bookings);
+});
+
 app.patch("/api/bookings/:id/cancel", verifyToken, verifyCustomer, async (request, response) => {
   const { id } = request.params;
   if (typeof id !== "string" || !ObjectId.isValid(id)) {

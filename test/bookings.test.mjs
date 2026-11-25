@@ -12,11 +12,13 @@ const [{ app, ensureBookingIndex }, { mongoDatabase }, { createAccessToken }] = 
 const customerId = new ObjectId();
 const secondCustomerId = new ObjectId();
 const technicianId = new ObjectId();
+const secondTechnicianId = new ObjectId();
 const serviceId = new ObjectId();
 const users = [
   { _id: customerId, role: "customer", name: "Real Customer", email: "customer@example.com" },
   { _id: secondCustomerId, role: "customer", name: "Second Customer", email: "second@example.com" },
   { _id: technicianId, role: "technician", name: "Real Technician", email: "tech@example.com" },
+  { _id: secondTechnicianId, role: "technician", name: "Second Technician", email: "tech2@example.com" },
 ];
 const service = {
   _id: serviceId, approvalStatus: "approved", isAvailable: true, title: "AC repair",
@@ -43,7 +45,7 @@ mongoDatabase.collection = (name) => {
       sort: (order) => ({
         toArray: async () => {
           assert.deepEqual(order, { createdAt: -1 });
-          return saved.filter((booking) => booking.customerId === filter.customerId)
+          return saved.filter((booking) => Object.entries(filter).every(([key, value]) => booking[key] === value))
             .sort((a, b) => b.createdAt - a.createdAt);
         },
       }),
@@ -84,14 +86,16 @@ let url;
 let customerToken;
 let secondCustomerToken;
 let technicianToken;
+let secondTechnicianToken;
 before(async () => {
   server = app.listen(0);
   await new Promise((resolve) => server.once("listening", resolve));
   url = `http://127.0.0.1:${server.address().port}/api/bookings`;
-  [customerToken, secondCustomerToken, technicianToken] = await Promise.all([
+  [customerToken, secondCustomerToken, technicianToken, secondTechnicianToken] = await Promise.all([
     createAccessToken(customerId.toHexString()),
     createAccessToken(secondCustomerId.toHexString()),
     createAccessToken(technicianId.toHexString()),
+    createAccessToken(secondTechnicianId.toHexString()),
   ]);
 });
 after(async () => {
@@ -219,4 +223,50 @@ test("customer cannot cancel an accepted booking", async () => {
   });
   assert.equal(response.status, 404);
   assert.equal(booking.status, "accepted");
+});
+
+test("technician requests are scoped to the owner and filtered by status", async () => {
+  saved.length = 0;
+  const statuses = ["requested", "accepted", "in-progress", "completed", "cancelled"];
+  for (const [index, status] of statuses.entries()) {
+    saved.push({
+      _id: new ObjectId(), technicianId: technicianId.toHexString(),
+      status, serviceTitle: `First technician ${status}`,
+      createdAt: new Date(2026, 10, 20 + index),
+    });
+  }
+  saved.push({
+    _id: new ObjectId(), technicianId: secondTechnicianId.toHexString(),
+    status: "requested", serviceTitle: "Second technician request", createdAt: new Date(2026, 10, 25),
+  });
+
+  async function getRequests(token, status) {
+    const endpoint = new URL(`${url}/technician`);
+    if (status) endpoint.searchParams.set("status", status);
+    const response = await fetch(endpoint, {
+      headers: token ? { authorization: `Bearer ${token}` } : {},
+    });
+    return { status: response.status, body: await response.json() };
+  }
+
+  const firstAll = await getRequests(technicianToken);
+  assert.equal(firstAll.status, 200);
+  assert.deepEqual(firstAll.body.map((booking) => booking.status), [...statuses].reverse());
+  assert.ok(firstAll.body.every((booking) => booking.technicianId === technicianId.toHexString()));
+
+  const secondAll = await getRequests(secondTechnicianToken, "all");
+  assert.equal(secondAll.status, 200);
+  assert.deepEqual(secondAll.body.map((booking) => booking.serviceTitle), ["Second technician request"]);
+
+  for (const status of statuses.slice(0, 4)) {
+    const result = await getRequests(technicianToken, status);
+    assert.equal(result.status, 200);
+    assert.deepEqual(result.body.map((booking) => booking.status), [status]);
+    assert.ok(result.body.every((booking) => booking.technicianId === technicianId.toHexString()));
+  }
+  const secondRequested = await getRequests(secondTechnicianToken, "requested");
+  assert.deepEqual(secondRequested.body.map((booking) => booking.serviceTitle), ["Second technician request"]);
+  assert.equal((await getRequests(technicianToken, "cancelled")).status, 400);
+  assert.equal((await getRequests(customerToken, "all")).status, 403);
+  assert.equal((await getRequests(undefined, "all")).status, 401);
 });
