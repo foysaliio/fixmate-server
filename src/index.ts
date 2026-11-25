@@ -5,6 +5,7 @@ import { auth } from "./lib/auth.ts";
 import { mongoClient, mongoDatabase } from "./lib/mongodb.ts";
 import { createAccessToken } from "./lib/access-token.ts";
 import { getStripeClient } from "./lib/stripe.ts";
+import { ensurePaymentIndexes, PaymentVerificationError, saveVerifiedPayment } from "./lib/save-payment.ts";
 import { verifyAdmin, verifyCustomer, verifyTechnician, verifyToken } from "./middleware/auth.ts";
 import { parseImage, uploadImage } from "./routes/upload-image.ts";
 
@@ -726,6 +727,43 @@ app.post("/api/payments/create-checkout-session", verifyToken, verifyCustomer, a
   response.json({ url: session.url });
 });
 
+app.get("/api/payments/verify", verifyToken, verifyCustomer, async (request, response) => {
+  const sessionId = request.query.session_id;
+  if (typeof sessionId !== "string" || !sessionId.startsWith("cs_") || sessionId.length > 255) {
+    response.status(400).json({ message: "A valid session_id is required" });
+    return;
+  }
+
+  const stripe = getStripeClient();
+  if (!stripe) {
+    response.status(503).json({ message: "Payment verification is not configured" });
+    return;
+  }
+
+  let checkout;
+  try {
+    checkout = await stripe.checkout.sessions.retrieve(sessionId);
+  } catch (error) {
+    if (error && typeof error === "object" && "code" in error && error.code === "resource_missing") {
+      response.status(404).json({ message: "Checkout Session not found" });
+      return;
+    }
+    throw error;
+  }
+
+  try {
+    const customerId = (response.locals.authUser as { id: string }).id;
+    const receipt = await saveVerifiedPayment(checkout, customerId);
+    response.json(receipt);
+  } catch (error) {
+    if (error instanceof PaymentVerificationError) {
+      response.status(error.statusCode).json({ message: error.message });
+      return;
+    }
+    throw error;
+  }
+});
+
 const adminServiceStatuses = new Set(["pending", "approved", "rejected", "all"]);
 
 app.get("/api/admin/services", verifyToken, verifyAdmin, async (request, response) => {
@@ -773,6 +811,7 @@ async function startServer() {
     console.log("MongoDB ping succeeded.");
 
     await ensureBookingIndex();
+    await ensurePaymentIndexes();
 
     app.listen(port, () => {
       console.log(`FixMate server listening on http://localhost:${port}`);
@@ -788,4 +827,4 @@ if (process.env.NODE_ENV !== "test") {
   void startServer();
 }
 
-export { app, ensureBookingIndex };
+export { app, ensureBookingIndex, ensurePaymentIndexes };
