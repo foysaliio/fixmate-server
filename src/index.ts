@@ -850,6 +850,15 @@ app.get("/api/admin/bookings", verifyToken, verifyAdmin, async (request, respons
   response.json(bookings);
 });
 
+app.get("/api/admin/payments", verifyToken, verifyAdmin, async (_request, response) => {
+  const payments = await mongoDatabase.collection("payments")
+    .find({ paymentStatus: "paid" })
+    .sort({ paidAt: -1, _id: -1 })
+    .toArray();
+  const totalCents = payments.reduce((sum, payment) => sum + (typeof payment.amountCents === "number" ? payment.amountCents : 0), 0);
+  response.json({ payments, totalRevenue: totalCents / 100 });
+});
+
 app.patch("/api/admin/users/:id/role", verifyToken, verifyAdmin, async (request, response) => {
   const { id } = request.params;
   if (typeof id !== "string" || !/^[0-9a-fA-F]{24}$/.test(id)) {
