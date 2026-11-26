@@ -4,6 +4,7 @@ import { ObjectId, MongoServerError } from "mongodb";
 
 process.env.NODE_ENV = "test";
 process.env.STRIPE_SECRET_KEY = "sk_test_mock";
+process.env.STRIPE_WEBHOOK_SECRET = "whsec_test_fixmate_webhook";
 
 const [{ app, ensurePaymentIndexes }, { mongoClient, mongoDatabase }, { createAccessToken }, { getStripeClient }] = await Promise.all([
   import("../dist/index.js"),
@@ -112,6 +113,7 @@ stripe.checkout.sessions.retrieve = async (id) => id === checkout.id ? checkout 
 
 let server;
 let endpoint;
+let webhookEndpoint;
 let customerToken;
 let otherCustomerToken;
 let technicianToken;
@@ -119,6 +121,7 @@ before(async () => {
   server = app.listen(0);
   await new Promise((resolve) => server.once("listening", resolve));
   endpoint = `http://127.0.0.1:${server.address().port}/api/payments/verify`;
+  webhookEndpoint = `http://127.0.0.1:${server.address().port}/api/payments/webhook`;
   [customerToken, otherCustomerToken, technicianToken] = await Promise.all([
     createAccessToken(customerId.toHexString()),
     createAccessToken(otherCustomerId.toHexString()),
@@ -143,6 +146,22 @@ after(async () => {
 async function verify(token = customerToken, sessionId = stripeSessionId) {
   const response = await fetch(`${endpoint}?session_id=${encodeURIComponent(sessionId)}`, {
     headers: token ? { authorization: `Bearer ${token}` } : {},
+  });
+  return { status: response.status, body: await response.json() };
+}
+
+async function sendWebhook({ validSignature = true, eventId = "evt_test_paid_1" } = {}) {
+  const payload = JSON.stringify({
+    id: eventId, object: "event", type: "checkout.session.completed",
+    data: { object: checkout },
+  });
+  const signature = stripe.webhooks.generateTestHeaderString({
+    payload, secret: validSignature ? process.env.STRIPE_WEBHOOK_SECRET : "whsec_wrong_secret",
+  });
+  const response = await fetch(webhookEndpoint, {
+    method: "POST",
+    headers: { "content-type": "application/json", "stripe-signature": signature },
+    body: payload,
   });
   return { status: response.status, body: await response.json() };
 }
@@ -211,6 +230,42 @@ test("verifying the same session twice returns the first receipt", async () => {
   assert.equal(payments.length, 1);
   assert.equal(bookings[0].paymentStatus, "paid");
   assert.equal(writesInTransaction, 2);
+});
+
+test("valid test-mode webhook signature marks booking paid without opening Success page", async () => {
+  const result = await sendWebhook();
+  assert.equal(result.status, 200);
+  assert.equal(bookings[0].paymentStatus, "paid");
+  assert.equal(payments.length, 1);
+  assert.equal(result.body.paymentId, payments[0]._id.toHexString());
+  assert.equal(transactions, 1);
+});
+
+test("invalid webhook signature returns 400 and writes nothing", async () => {
+  const result = await sendWebhook({ validSignature: false });
+  assert.equal(result.status, 400);
+  assert.equal(bookings[0].paymentStatus, "unpaid");
+  assert.equal(payments.length, 0);
+  assert.equal(transactions, 0);
+});
+
+test("duplicate signed webhook returns the original payment record", async () => {
+  const first = await sendWebhook();
+  const second = await sendWebhook();
+  assert.equal(first.status, 200);
+  assert.equal(second.status, 200);
+  assert.equal(second.body.paymentId, first.body.paymentId);
+  assert.equal(payments.length, 1);
+  assert.equal(bookings[0].paymentStatus, "paid");
+  assert.equal(writesInTransaction, 2);
+});
+
+test("completed but unpaid webhook does not mark booking paid", async () => {
+  checkout.payment_status = "unpaid";
+  const result = await sendWebhook();
+  assert.equal(result.status, 200);
+  assert.equal(bookings[0].paymentStatus, "unpaid");
+  assert.equal(payments.length, 0);
 });
 
 test("wrong email, currency, amount or booking session is refused", async () => {

@@ -13,6 +13,44 @@ const app = express();
 const port = Number(process.env.PORT) || 5000;
 
 app.all("/api/auth/*splat", toNodeHandler(auth));
+app.post("/api/payments/webhook", express.raw({ type: "application/json" }), async (request, response) => {
+  const stripe = getStripeClient();
+  const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+  if (!stripe || !webhookSecret) {
+    response.status(503).json({ message: "Payment webhook is not configured" });
+    return;
+  }
+
+  const signature = request.headers["stripe-signature"];
+  if (typeof signature !== "string" || !Buffer.isBuffer(request.body)) {
+    response.status(400).json({ message: "Invalid Stripe signature" });
+    return;
+  }
+
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(request.body, signature, webhookSecret);
+  } catch {
+    response.status(400).json({ message: "Invalid Stripe signature" });
+    return;
+  }
+
+  if (event.type === "checkout.session.completed" && event.data.object.payment_status === "paid") {
+    try {
+      const payment = await saveVerifiedPayment(event.data.object);
+      response.json({ received: true, paymentId: String(payment._id) });
+    } catch (error) {
+      if (error instanceof PaymentVerificationError) {
+        response.status(error.statusCode).json({ message: error.message });
+        return;
+      }
+      throw error;
+    }
+    return;
+  }
+
+  response.json({ received: true });
+});
 app.use(express.json());
 
 app.get("/api/health", (_request, response) => {
