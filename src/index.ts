@@ -833,6 +833,23 @@ app.get("/api/admin/users", verifyToken, verifyAdmin, async (_request, response)
   response.json(users.map(adminUserSummary));
 });
 
+const adminBookingStatuses = new Set(["all", "requested", "accepted", "in-progress", "completed", "rejected", "cancelled"]);
+
+app.get("/api/admin/bookings", verifyToken, verifyAdmin, async (request, response) => {
+  const status = request.query.status ?? "all";
+  if (typeof status !== "string" || !adminBookingStatuses.has(status)) {
+    response.status(400).json({ message: "Invalid booking status" });
+    return;
+  }
+
+  const filter = status === "all" ? {} : { status };
+  const bookings = await mongoDatabase.collection("bookings")
+    .find(filter)
+    .sort({ createdAt: -1, _id: -1 })
+    .toArray();
+  response.json(bookings);
+});
+
 app.patch("/api/admin/users/:id/role", verifyToken, verifyAdmin, async (request, response) => {
   const { id } = request.params;
   if (typeof id !== "string" || !/^[0-9a-fA-F]{24}$/.test(id)) {
