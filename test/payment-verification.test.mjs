@@ -70,6 +70,15 @@ mongoDatabase.collection = (name) => {
   };
   if (name === "payments") return {
     createIndex: async (keys, options) => { indexes.push({ keys, options }); },
+    find: (filter) => ({
+      sort: (order) => {
+        assert.deepEqual(order, { paidAt: -1, _id: -1 });
+        return {
+          toArray: async () => payments.filter((payment) => matches(payment, filter))
+            .sort((left, right) => right.paidAt - left.paidAt || right._id.toHexString().localeCompare(left._id.toHexString())),
+        };
+      },
+    }),
     findOne: async (filter, options) => {
       if (options) assert.ok(options.session);
       return payments.find((payment) => matches(payment, filter)) ?? null;
@@ -150,6 +159,13 @@ async function verify(token = customerToken, sessionId = stripeSessionId) {
   return { status: response.status, body: await response.json() };
 }
 
+async function myPayments(token) {
+  const response = await fetch(`${new URL(endpoint).origin}/api/payments/my`, {
+    headers: token ? { authorization: `Bearer ${token}` } : {},
+  });
+  return { status: response.status, body: await response.json() };
+}
+
 async function sendWebhook({ validSignature = true, eventId = "evt_test_paid_1" } = {}) {
   const payload = JSON.stringify({
     id: eventId, object: "event", type: "checkout.session.completed",
@@ -172,6 +188,26 @@ test("payments has unique bookingId and stripeSessionId indexes", async () => {
     { keys: { bookingId: 1 }, options: { name: "unique_payment_booking", unique: true } },
     { keys: { stripeSessionId: 1 }, options: { name: "unique_payment_stripe_session", unique: true } },
   ]);
+});
+
+test("two customers see only their own paid payments, newest first", async () => {
+  payments = [
+    { _id: new ObjectId(), customerId: customerId.toHexString(), paymentStatus: "paid", serviceTitle: "Older repair", paidAt: new Date("2026-11-20T10:00:00Z") },
+    { _id: new ObjectId(), customerId: otherCustomerId.toHexString(), paymentStatus: "paid", serviceTitle: "Other repair", paidAt: new Date("2026-11-22T10:00:00Z") },
+    { _id: new ObjectId(), customerId: customerId.toHexString(), paymentStatus: "unpaid", serviceTitle: "Unpaid repair", paidAt: new Date("2026-11-24T10:00:00Z") },
+    { _id: new ObjectId(), customerId: customerId.toHexString(), paymentStatus: "paid", serviceTitle: "Newer repair", paidAt: new Date("2026-11-23T10:00:00Z") },
+  ];
+
+  const first = await myPayments(customerToken);
+  const second = await myPayments(otherCustomerToken);
+  assert.equal(first.status, 200);
+  assert.equal(second.status, 200);
+  assert.deepEqual(first.body.map((payment) => payment.serviceTitle), ["Newer repair", "Older repair"]);
+  assert.deepEqual(second.body.map((payment) => payment.serviceTitle), ["Other repair"]);
+  assert.ok(first.body.every((payment) => payment.customerId === customerId.toHexString() && payment.paymentStatus === "paid"));
+  assert.ok(second.body.every((payment) => payment.customerId === otherCustomerId.toHexString() && payment.paymentStatus === "paid"));
+  assert.equal((await myPayments(technicianToken)).status, 403);
+  assert.equal((await myPayments()).status, 401);
 });
 
 test("paid session writes receipt and marks booking paid in one transaction", async () => {

@@ -556,6 +556,15 @@ app.get("/api/bookings/my", verifyToken, verifyCustomer, async (_request, respon
   response.json(bookings);
 });
 
+app.get("/api/payments/my", verifyToken, verifyCustomer, async (_request, response) => {
+  const customerId = (response.locals.authUser as { id: string }).id;
+  const payments = await mongoDatabase.collection("payments")
+    .find({ customerId, paymentStatus: "paid" })
+    .sort({ paidAt: -1, _id: -1 })
+    .toArray();
+  response.json(payments);
+});
+
 const technicianBookingStatuses = new Set(["all", "requested", "accepted", "in-progress", "completed"]);
 
 app.get("/api/bookings/technician", verifyToken, verifyTechnician, async (request, response) => {
@@ -803,6 +812,59 @@ app.get("/api/payments/verify", verifyToken, verifyCustomer, async (request, res
 });
 
 const adminServiceStatuses = new Set(["pending", "approved", "rejected", "all"]);
+const adminUserRoles = new Set(["customer", "technician", "admin"]);
+
+function adminUserSummary(user: Document) {
+  return {
+    id: String(user._id),
+    image: user.image ?? null,
+    name: user.name,
+    email: user.email,
+    role: user.role,
+    createdAt: user.createdAt,
+  };
+}
+
+app.get("/api/admin/users", verifyToken, verifyAdmin, async (_request, response) => {
+  const users = await mongoDatabase.collection("users")
+    .find({}, { projection: { image: 1, name: 1, email: 1, role: 1, createdAt: 1 } })
+    .sort({ createdAt: -1, _id: -1 })
+    .toArray();
+  response.json(users.map(adminUserSummary));
+});
+
+app.patch("/api/admin/users/:id/role", verifyToken, verifyAdmin, async (request, response) => {
+  const { id } = request.params;
+  if (typeof id !== "string" || !/^[0-9a-fA-F]{24}$/.test(id)) {
+    response.status(400).json({ message: "A valid user ID is required" });
+    return;
+  }
+
+  const body: unknown = request.body;
+  if (!body || typeof body !== "object" || Array.isArray(body) ||
+    Object.keys(body).length !== 1 ||
+    typeof (body as Record<string, unknown>).role !== "string" ||
+    !adminUserRoles.has((body as { role: string }).role)) {
+    response.status(400).json({ message: "role must be customer, technician or admin" });
+    return;
+  }
+
+  if (id.toLowerCase() === (response.locals.authUser as { id: string }).id.toLowerCase()) {
+    response.status(403).json({ message: "You cannot change your own role" });
+    return;
+  }
+
+  const user = await mongoDatabase.collection("users").findOneAndUpdate(
+    { _id: new ObjectId(id) },
+    { $set: { role: (body as { role: string }).role, updatedAt: new Date() } },
+    { returnDocument: "after", projection: { image: 1, name: 1, email: 1, role: 1, createdAt: 1 } },
+  );
+  if (!user) {
+    response.status(404).json({ message: "User not found" });
+    return;
+  }
+  response.json(adminUserSummary(user));
+});
 
 app.get("/api/admin/services", verifyToken, verifyAdmin, async (request, response) => {
   const status = request.query.status === undefined ? "pending" : request.query.status;
