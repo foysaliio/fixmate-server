@@ -430,7 +430,14 @@ app.get("/api/services/:id", async (request, response) => {
     return;
   }
 
-  response.json(service);
+  const technician = typeof service.technicianEmail === "string"
+    ? await mongoDatabase.collection("users").findOne(
+      { email: service.technicianEmail, role: "technician" },
+      { projection: { _id: 0, name: 1, image: 1, area: 1, bio: 1 } },
+    )
+    : null;
+
+  response.json({ ...service, technician });
 });
 
 const activeBookingStatuses = ["requested", "accepted", "in-progress"];
